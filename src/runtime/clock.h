@@ -72,29 +72,54 @@ rdtsc_precise(void)
     asm volatile("cpuid" ::: "%rax", "%rbx", "%rcx", "%rdx"); /* serialize execution */
     return _rdtsc();
 }
+
+static inline s64 clock_get_drift(timestamp raw)
+{
+    if (!__vdso_dat->temp_cal && !__vdso_dat->cal)
+        return 0;
+    s64 drift = __vdso_dat->last_drift;
+    if (raw > __vdso_dat->sync_complete) {
+        if (__vdso_dat->last_raw > __vdso_dat->sync_complete) {
+            drift += (raw - __vdso_dat->last_raw) * __vdso_dat->cal;
+        } else {
+            drift += (__vdso_dat->sync_complete - __vdso_dat->last_raw) * __vdso_dat->temp_cal;
+            drift += (raw - __vdso_dat->sync_complete) * __vdso_dat->cal;
+        }
+    } else {
+        drift += (raw - __vdso_dat->last_raw) * __vdso_dat->temp_cal;
+    }
+    return drift;
+}
+
+static inline s64 clock_update_drift(timestamp raw)
+{
+    s64 drift = clock_get_drift(raw);
+    __vdso_dat->last_drift = drift;
+    __vdso_dat->last_raw = raw;
+    return drift;
+}
 #endif
 
 /* This is all kernel-only below here */
 static inline timestamp now(clock_id id)
 {
-#if defined(STAGE3) || defined(BUILD_VDSO)
-    u64 rtc_offset = __vdso_dat->rtc_offset;
-#else
-    u64 rtc_offset = 0;
-#endif
+    timestamp t = apply(platform_monotonic_now);
 
+#if defined(STAGE3) || defined(BUILD_VDSO)
+    if (id == CLOCK_ID_MONOTONIC_RAW)
+        return t;
+    t += clock_update_drift(t);
     switch (id) {
-    case CLOCK_ID_MONOTONIC:
-    case CLOCK_ID_MONOTONIC_RAW:
-    case CLOCK_ID_MONOTONIC_COARSE:
-    case CLOCK_ID_BOOTTIME:
-        return apply(platform_monotonic_now);
     case CLOCK_ID_REALTIME:
     case CLOCK_ID_REALTIME_COARSE:
-        return apply(platform_monotonic_now) + rtc_offset;
+        t += __vdso_dat->rtc_offset;
+        break;
     default:
-        return 0;
+        break;
     }
+#endif
+
+    return t;
 }
 
 static inline timestamp uptime(void)
@@ -103,6 +128,7 @@ static inline timestamp uptime(void)
 }
 
 u64 rtc_gettimeofday(void);
+void rtc_settimeofday(u64 seconds);
 
 static inline void register_platform_clock_now(clock_now cn, vdso_clock_id id)
 {
@@ -110,8 +136,13 @@ static inline void register_platform_clock_now(clock_now cn, vdso_clock_id id)
 #if defined(STAGE3) || defined(BUILD_VDSO)
     __vdso_dat->clock_src = id;
     __vdso_dat->rtc_offset = (rtc_gettimeofday() << 32) - apply(cn);
+    __vdso_dat->temp_cal = __vdso_dat->cal = 0;
+    __vdso_dat->sync_complete = 0;
+    __vdso_dat->last_raw = __vdso_dat->last_drift = 0;
 #endif
 }
+
+void clock_adjust(timestamp wallclock_now, double temp_cal, timestamp sync_complete, double cal);
 
 #if defined(STAGE3) || defined(BUILD_VDSO)
 #undef __vdso_dat
